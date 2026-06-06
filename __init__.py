@@ -21,6 +21,7 @@ from binaryninja.interaction import get_directory_name_input
 from binaryninja.lineardisassembly import LinearViewCursor, LinearViewObject
 from binaryninja.log import log_alert, log_error, log_info, log_warn
 from binaryninja.plugin import BackgroundTaskThread, PluginCommand
+from binaryninja.typeprinter import TypePrinter
 
 
 class PseudoCDump(BackgroundTaskThread):
@@ -38,9 +39,12 @@ class PseudoCDump(BackgroundTaskThread):
             functions will be written. In this case, is a constant string 'c'
             (file extension .c).
 
+        TYPE_HEADER_FILENAME: The shared header containing user-defined types.
+
         MAX_PATH: Maximum path length (255).            
     """
     FILE_SUFFIX = 'c'
+    TYPE_HEADER_FILENAME = 'types.h'
     MAX_PATH = 255
 
     def __init__(self, bv: BinaryView, msg: str, destination_path: str):
@@ -104,10 +108,21 @@ class PseudoCDump(BackgroundTaskThread):
     def run(self) -> None:
         """Method representing the thread's activity. It invokes the callable
         object passed to the object's constructor as the target argument.
-        Additionally, writes the content of each function into a <function_name>.c
-        file in the provided destination folder.
+        It writes user-defined types to types.h, then writes each function to a
+        <function_name>.c file that includes the shared header.
         """
         self.destination_path = self.__create_directory()
+        user_types = get_user_defined_types(self.bv)
+        type_header = get_user_type_header(self.bv, user_types)
+        type_header_destination = os.path.join(
+            self.destination_path, self.TYPE_HEADER_FILENAME)
+        with open(type_header_destination, 'w', encoding='utf-8',
+                  newline='\n') as file:
+            file.write(type_header)
+        log_info(
+            f'Dumped {len(user_types)} user-defined types to '
+            f'{self.TYPE_HEADER_FILENAME}')
+
         log_info(f'Number of functions to dump: {len(self.bv.functions)}')
         count = 1
         for function in self.bv.functions:
@@ -117,11 +132,14 @@ class PseudoCDump(BackgroundTaskThread):
                 count, len(self.bv.functions))
             force_analysis(self.bv, function)
             pcode = get_pseudo_c(self.bv, function)
+            pcode = add_type_header_include(
+                pcode, self.TYPE_HEADER_FILENAME)
             destination = os.path.join(
                 self.destination_path,
                 normalize_destination_file(function_name, self.FILE_SUFFIX))
-            with open(destination, 'wb') as file:
-                file.write(bytes(pcode, 'utf-8'))
+            with open(destination, 'w', encoding='utf-8',
+                      newline='\n') as file:
+                file.write(pcode)
             count += 1
         log_alert(f'Done \nFiles saved in {self.destination_path}')
 
@@ -149,6 +167,32 @@ def normalize_destination_file(destination_file: str,
         normalized_destination_file = '.'.join(
             (re.sub(r'/', '_', destination_file), filename_suffix))
         return normalized_destination_file
+
+
+def get_user_defined_types(bv: BinaryView):
+    """Returns user-defined types in dependency order.
+
+    Binary Ninja's type list also contains automatically imported platform and
+    type-library definitions. Those are intentionally excluded so the dumped
+    header reflects only types created or overridden by the user.
+    """
+    return [
+        (name, type_obj)
+        for name, type_obj in bv.dependency_sorted_types.items()
+        if not bv.is_type_auto_defined(name)
+    ]
+
+
+def get_user_type_header(bv: BinaryView, user_types=None) -> str:
+    """Renders user-defined types as a C-compatible header."""
+    if user_types is None:
+        user_types = get_user_defined_types(bv)
+    return TypePrinter.default.print_all_types(user_types, bv)
+
+
+def add_type_header_include(pcode: str, header_filename: str) -> str:
+    """Makes a dumped function source reference the shared type header."""
+    return f'#include "{header_filename}"\n\n{pcode}'
 
 
 def force_analysis(bv: BinaryView, function: Function) -> None:
